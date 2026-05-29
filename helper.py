@@ -6,6 +6,7 @@ import threading
 import time
 import logging
 import random
+import sys
 from flask import Flask, jsonify, request
 from collections import deque
 from urllib3.exceptions import InsecureRequestWarning
@@ -101,30 +102,23 @@ def theft_notification():
     
     try:
         data = request.get_json()
-        
         if not data:
             return jsonify({"error": "No data provided"}), 400
         
-        # Extract pet name from fields (look for "Pet Name" field)
         pet_name = None
         fields = data.get("fields", [])
         for field in fields:
             if "Pet Name" in field.get("name", ""):
-                # Extract pet name from field value (remove markdown formatting)
                 pet_value = field.get("value", "")
-                # Remove ** markdown
                 pet_name = pet_value.replace("**", "").strip()
                 break
         
-        # If pet name not found in fields, try to extract from description
         if not pet_name:
             description = data.get("description", "")
-            # Description format: "**Username** stole **PetName**"
             match = re.search(r'\*\*([^*]+)\*\*$', description)
             if match:
                 pet_name = match.group(1).strip()
         
-        # Check if pet image exists - only send if image is found
         if not pet_name or pet_name not in PET_IMAGES:
             logging.info(f"Theft notification skipped - no image found for pet: {pet_name}")
             return jsonify({
@@ -132,11 +126,8 @@ def theft_notification():
                 "message": f"No image found for pet: {pet_name or 'Unknown'}"
             }), 200
         
-        # Get thumbnail URL for pet
         thumbnail_url = PET_IMAGES[pet_name]
         
-        # Data comes as embed object directly from joiner.lua
-        # Forward to Discord webhook
         webhook_data = {
             "embeds": [{
                 "title": data.get("title", "Pet Stolen"),
@@ -145,20 +136,13 @@ def theft_notification():
                 "fields": data.get("fields", []),
                 "footer": data.get("footer", {}),
                 "timestamp": data.get("timestamp", ""),
-                "thumbnail": {
-                    "url": thumbnail_url
-                }
+                "thumbnail": { "url": thumbnail_url }
             }]
         }
         
-        # Send to Discord webhook
-        response = requests.post(
-            THEFT_WEBHOOK_URL,
-            json=webhook_data,
-            timeout=10
-        )
+        response = requests.post(THEFT_WEBHOOK_URL, json=webhook_data, timeout=10)
         
-        if response.status_code == 204 or response.status_code == 200:
+        if response.status_code in [200, 204]:
             logging.info(f"Theft notification sent: {data.get('description', 'Unknown')} (Pet: {pet_name})")
             return jsonify({"status": "success", "message": "Theft notification sent"})
         else:
@@ -177,22 +161,22 @@ MAIN_API_STATUS = os.getenv("MAIN_API_URL", "https://worker-production-2f05.up.r
 
 REQUEST_TIMEOUT = 20
 PAGE_DELAY = 0.05
-ID_TTL = 60 * 5  # ✅ Reduced from 15 minutes to 5 minutes
-MAX_SERVER_AGE = 60 * 8  # ✅ NEW: Servers older than 8 minutes are discarded
+ID_TTL = 60 * 5  
+MAX_SERVER_AGE = 60 * 8  
 BATCH_MIN = 300
 BATCH_MAX = 800
 MAX_QUEUE_SIZE = 15000
 TARGET_MAIN_API = 999999
 TARGET_MIN = 3
 TARGET_MAX = 7
-CACHE_CLEAR_INTERVAL = 600  # ✅ Increased from 5 to 10 minutes
+CACHE_CLEAR_INTERVAL = 600  
 
 # Hardcoded proxy configuration
-PROXY_HOST = 'na.nettify.xyz:8080'
-PROXY_AUTH = 'ymb2k0a4z70e:l3sf295s310e'
+PROXY_HOST = os.getenv("PROXY_HOST", "na.nettify.xyz:8080")
+PROXY_AUTH = os.getenv("PROXY_AUTH", "ymb2k0a4z70e:l3sf295s310e")
 
 def get_proxy_dict():
-    """Get proxy dict for requests - hardcoded proxy"""
+    """Get proxy dict for requests - supports environment variable fallbacks"""
     return {
         'http': f'http://{PROXY_AUTH}@{PROXY_HOST}',
         'https': f'http://{PROXY_AUTH}@{PROXY_HOST}'
@@ -202,62 +186,78 @@ FETCH_PATTERN = ["Asc", "Desc", "Asc"]
 
 priority_queue = deque(maxlen=MAX_QUEUE_SIZE)
 server_queue = deque(maxlen=MAX_QUEUE_SIZE)
-# ✅ REMOVED: recycle_queue - no more recycling old servers!
 sent_ids = {}
 server_cache = set()
-server_ages = {}  # ✅ NEW: Track when servers were discovered
-blacklisted_servers = set()  # ✅ NEW: Track failed servers reported by bots
+server_ages = {}  
+blacklisted_servers = set()  
 
 lock = threading.Lock()
 stats = {"fetched": 0, "sent": 0, "duplicates": 0, "errors": 0, "ratelimits": 0, "blacklisted": 0}
 
-# ✅ NEW: Add failure reporting endpoint
+# Global flag to track proxy validity across background threads
+proxy_functional = True
+
+class ProxyWatchdog(threading.Thread):
+    """Monitors consecutive errors across operations to trigger container termination"""
+    def __init__(self, failure_threshold=25):
+        super().__init__()
+        self.daemon = True
+        self.name = "watchdog"
+        self.failure_threshold = failure_threshold
+        self.consecutive_failures = 0
+
+    def increment_failure(self):
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.failure_threshold:
+            logging.critical(f"[WATCHDOG] Outage detected! {self.consecutive_failures} failures. Shutting down process.")
+            sys.exit(1)
+
+    def reset(self):
+        self.consecutive_failures = 0
+
+watchdog = ProxyWatchdog()
+watchdog.start()
+
 @app.route("/report-failure", methods=["POST"])
 def report_failure():
     """Allow bots to report failed servers"""
     try:
         data = request.get_json()
         job_id = data.get("job_id")
-        
         if not job_id:
             return jsonify({"error": "job_id required"}), 400
         
         with lock:
             blacklisted_servers.add(job_id)
             server_cache.discard(job_id)
-            
-            # Remove from sent_ids if present
-            if job_id in sent_ids:
-                del sent_ids[job_id]
-            
-            # Remove from server_ages if present
-            if job_id in server_ages:
-                del server_ages[job_id]
-            
+            if job_id in sent_ids: del sent_ids[job_id]
+            if job_id in server_ages: del server_ages[job_id]
             stats["blacklisted"] += 1
         
         logging.info(f"[BLACKLIST] Server reported as failed: {job_id}")
         return jsonify({"status": "blacklisted", "job_id": job_id})
-        
     except Exception as e:
         logging.error(f"Report failure error: {e}")
         return jsonify({"error": str(e)}), 500
 
 def test_proxy():
     """Test the hardcoded proxy"""
+    global proxy_functional
     try:
         r = requests.get(
             "https://api.ipify.org",
             proxies=get_proxy_dict(),
-            timeout=10,
+            timeout=8,
             verify=False
         )
         if r.status_code == 200:
             ip = r.text.strip()
             logging.info(f"[Proxy] OK - IP: {ip}")
+            proxy_functional = True
             return True
     except Exception as e:
-        logging.error(f"[Proxy] Failed: {e}")
+        logging.error(f"[Proxy] Health test failed: {e}")
+    proxy_functional = False
     return False
 
 def check_main_api_size():
@@ -270,16 +270,12 @@ def check_main_api_size():
     return 0
 
 def cleanup_sent_ids():
-    """✅ FIXED: Remove expired servers without recycling them"""
     now = time.time()
     expired = [job for job, t in sent_ids.items() if t <= now]
     for job in expired:
         del sent_ids[job]
         server_cache.discard(job)
-        # ✅ REMOVED: No more recycle_queue.append(job)
-        # Old servers just die instead of being reused
     
-    # ✅ NEW: Also clean up servers that are too old
     old_servers = [job for job, age in server_ages.items() if now - age > MAX_SERVER_AGE]
     for job in old_servers:
         del server_ages[job]
@@ -291,20 +287,14 @@ def cache_clearer():
     while True:
         time.sleep(CACHE_CLEAR_INTERVAL)
         with lock:
-            # ✅ CHANGED: Don't clear entire cache, just clean up old/blacklisted servers
             now = time.time()
             to_remove = set()
-            
             for job in server_cache:
-                # Remove if blacklisted or too old
                 if job in blacklisted_servers or (job in server_ages and now - server_ages[job] > MAX_SERVER_AGE):
                     to_remove.add(job)
-            
             for job in to_remove:
                 server_cache.discard(job)
-                if job in server_ages:
-                    del server_ages[job]
-            
+                if job in server_ages: del server_ages[job]
             logging.info(f"Cache cleaned: removed {len(to_remove)} old/blacklisted entries")
 
 def fetch_servers(sort_order):
@@ -313,7 +303,6 @@ def fetch_servers(sort_order):
     
     while True:
         main_api_size = check_main_api_size()
-        
         if main_api_size >= TARGET_MAIN_API:
             time.sleep(5)
             continue
@@ -339,40 +328,33 @@ def fetch_servers(sort_order):
             
             if r.status_code != 200:
                 consecutive_errors += 1
+                watchdog.increment_failure()
                 if consecutive_errors > 5:
                     cursor = None
                     consecutive_errors = 0
                 time.sleep(0.5)
                 continue
             
+            watchdog.reset()
             consecutive_errors = 0
             data = r.json().get("data", [])
-            
             priority = []
             current_time = time.time()
             
             for s in data:
-                if "id" not in s or "playing" not in s:
-                    continue
-                
+                if "id" not in s or "playing" not in s: continue
                 jid = s["id"]
                 players = s["playing"]
                 
-                if not (TARGET_MIN <= players <= TARGET_MAX):
-                    continue
+                if not (TARGET_MIN <= players <= TARGET_MAX): continue
                 
                 with lock:
-                    # ✅ NEW: Skip blacklisted servers
-                    if jid in blacklisted_servers:
-                        continue
-                    
+                    if jid in blacklisted_servers: continue
                     if jid in server_cache:
                         stats["duplicates"] += 1
                         continue
-                    
                     server_cache.add(jid)
-                    server_ages[jid] = current_time  # ✅ NEW: Track when discovered
-                
+                    server_ages[jid] = current_time
                 priority.append(jid)
             
             with lock:
@@ -388,14 +370,13 @@ def fetch_servers(sort_order):
                 cursor = None
                 time.sleep(0.5)
             
-        except requests.exceptions.Timeout:
+        except (requests.exceptions.Timeout, requests.exceptions.ProxyError):
             stats["errors"] += 1
-            logging.warning(f"[Proxy] Timeout")
+            watchdog.increment_failure()
             time.sleep(1)
-            
         except Exception as e:
             stats["errors"] += 1
-            logging.error(f"[Proxy] Error: {e}")
+            watchdog.increment_failure()
             time.sleep(1)
         
         time.sleep(PAGE_DELAY)
@@ -408,32 +389,19 @@ def sender():
         
         with lock:
             cleanup_sent_ids()
-            
             while priority_queue and len(batch) < target:
                 jid = priority_queue.popleft()
-                
-                # ✅ NEW: Skip if server is too old or blacklisted
-                if jid in blacklisted_servers:
-                    continue
-                if jid in server_ages and current_time - server_ages[jid] > MAX_SERVER_AGE:
-                    continue
-                
+                if jid in blacklisted_servers: continue
+                if jid in server_ages and current_time - server_ages[jid] > MAX_SERVER_AGE: continue
                 sent_ids[jid] = time.time() + ID_TTL
                 batch.append(jid)
             
             while server_queue and len(batch) < target:
                 jid = server_queue.popleft()
-                
-                # ✅ NEW: Skip if server is too old or blacklisted
-                if jid in blacklisted_servers:
-                    continue
-                if jid in server_ages and current_time - server_ages[jid] > MAX_SERVER_AGE:
-                    continue
-                
+                if jid in blacklisted_servers: continue
+                if jid in server_ages and current_time - server_ages[jid] > MAX_SERVER_AGE: continue
                 sent_ids[jid] = time.time() + ID_TTL
                 batch.append(jid)
-            
-            # ✅ REMOVED: No more recycle_queue processing
         
         if batch:
             try:
@@ -448,12 +416,10 @@ def sender():
         time.sleep(0.04)
 
 def start_threads():
-    # Test the hardcoded proxy
     test_proxy()
-    
     threading.Thread(target=cache_clearer, daemon=True, name="cache-clearer").start()
     
-    for i, sort_order in enumerate(FETCH_PATTERN):
+    for sort_order in FETCH_PATTERN:
         for j in range(3):
             threading.Thread(target=fetch_servers, args=(sort_order,), daemon=True, name=f"fetch-{sort_order}-{j}").start()
             time.sleep(0.05)
@@ -462,19 +428,12 @@ def start_threads():
         threading.Thread(target=sender, daemon=True, name=f"sender-{i}").start()
     
     logging.info("Mini API started")
-    logging.info(f"Proxy: {PROXY_HOST}")
-    logging.info(f"Target API: {MAIN_API_URL}")
-    logging.info(f"Pattern: ASC -> DESC -> ASC (9 fetch + 4 sender)")
-    logging.info(f"Player filter: {TARGET_MIN}-{TARGET_MAX}")
-    logging.info(f"Max server age: {MAX_SERVER_AGE}s")
-    logging.info(f"Cache clear interval: {CACHE_CLEAR_INTERVAL}s")
 
 start_threads()
 
 @app.route("/")
 def home():
     main_api_size = check_main_api_size()
-    
     with lock:
         cleanup_sent_ids()
         elapsed = time.time() - start_time
@@ -489,56 +448,29 @@ def home():
             "main_api_size": main_api_size,
             "rate": f"{rate:.1f} servers/sec",
             "proxy": PROXY_HOST,
+            "proxy_up": proxy_functional,
             "max_server_age": MAX_SERVER_AGE
         })
 
 @app.route("/test-proxies")
 def test_proxies_endpoint():
-    """Test the hardcoded proxy"""
-    try:
-        r = requests.get(
-            "https://api.ipify.org",
-            proxies=get_proxy_dict(),
-            timeout=10,
-            verify=False
-        )
-        if r.status_code == 200:
-            return jsonify({
-                "proxy": PROXY_HOST,
-                "status": "ok",
-                "ip": r.text.strip()
-            })
-        else:
-            return jsonify({
-                "proxy": PROXY_HOST,
-                "status": "error",
-                "code": r.status_code
-            }), 500
-    except Exception as e:
-        return jsonify({
-            "proxy": PROXY_HOST,
-            "status": "failed",
-            "error": str(e)
-        }), 500
+    if test_proxy():
+        return jsonify({"proxy": PROXY_HOST, "status": "ok"})
+    return jsonify({"proxy": PROXY_HOST, "status": "failed"}), 500
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "healthy", "queue": len(priority_queue) + len(server_queue)})
+    """Reflect proxy health directly to container orchestration engines"""
+    if not proxy_functional:
+        return jsonify({"status": "unhealthy", "reason": "Proxy connection offline"}), 500
+    return jsonify({"status": "healthy", "queue": len(priority_queue) + len(server_queue)}), 200
 
 @app.route("/routes")
 def list_routes():
-    """Debug endpoint to list all registered routes"""
-    routes = []
-    for rule in app.url_map.iter_rules():
-        routes.append({
-            "endpoint": rule.endpoint,
-            "methods": list(rule.methods),
-            "path": rule.rule
-        })
-    return jsonify({"routes": routes})
+    return jsonify({"routes": [{"endpoint": r.endpoint, "methods": list(r.methods), "path": r.rule} for r in app.url_map.iter_rules()]})
 
 start_time = time.time()
 
 if __name__ == "__main__":
-    port = int(os.environ["PORT1"])
+    port = int(os.environ.get("PORT1", 8962))
     app.run("0.0.0.0", port, threaded=True)
